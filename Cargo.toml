@@ -1,0 +1,23 @@
+[package]
+name = "indxdb"
+publish = true
+edition = "2021"
+version = "0.1.0"
+readme = "README.md"
+authors = ["Tobie Morgan Hitchcock <tobie@surrealdb.com>"]
+description = "A key-value database engine abstraction layer for IndexedDB running in WASM"
+repository = "https://github.com/surrealdb/indxdb"
+homepage = "https://github.com/surrealdb/indxdb"
+keywords = ["database", "embedded-database", "indexeddb", "idb", "wasm"]
+categories = ["database-implementations", "web-programming", "wasm"]
+license = "Apache-2.0"
+
+[dependencies]
+js-sys = "0.3.56"
+rexie = "0.2.1"
+thiserror = "1.0.30"
+tokio = { version = "1.17.0", features = ["sync"] }
+wasm-bindgen = { version = "0.2.79", features = ["serde-serialize"] }
+
+[dev-dependencies]
+tokio = { version = "1.17.0", features = ["rt", "macros"] }
