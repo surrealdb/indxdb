@@ -85,7 +85,7 @@ impl Tx {
 		// Mark this transaction as done
 		self.ok = true;
 		// Commit the indexdb transaction
-		self.tx.take().unwrap().commit().await?;
+		self.tx.take().unwrap().done().await?;
 		// Unlock the database mutex
 		if let Some(lk) = self.lk.take() {
 			drop(lk);

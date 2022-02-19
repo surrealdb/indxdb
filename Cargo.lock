@@ -106,9 +106,9 @@ dependencies = [
 
 [[package]]
 name = "rexie"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ed2b22c65c32a8bd7cc1517fe02a8240839cba64e4cba7787e758f70f011b25"
+checksum = "e8e6178d9a4aaae55ce07627003b9281dd02ffd0f489b4f80e1e242380492744"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",

@@ -14,7 +14,7 @@ license = "Apache-2.0"
 
 [dependencies]
 js-sys = "0.3.56"
-rexie = "0.2.1"
+rexie = "0.3.0"
 thiserror = "1.0.30"
 tokio = { version = "1.17.0", features = ["sync"] }
 wasm-bindgen = { version = "0.2.79", features = ["serde-serialize"] }
