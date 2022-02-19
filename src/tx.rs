@@ -25,8 +25,6 @@ use tokio::sync::OwnedMutexGuard;
 pub struct Tx {
 	// Is the transaction complete?
 	pub(crate) ok: bool,
-	// Is the transaction active?
-	pub(crate) ac: bool,
 	// Is the transaction read+write?
 	pub(crate) rw: bool,
 	// The underlying database store
@@ -47,7 +45,6 @@ impl Tx {
 	) -> Tx {
 		Tx {
 			ok: false,
-			ac: false,
 			rw: write,
 			lk: guard,
 			st: Some(st),
@@ -67,9 +64,7 @@ impl Tx {
 		// Mark this transaction as done
 		self.ok = true;
 		// Abort the indexdb transaction
-		if self.ac {
-			self.tx.take().unwrap().abort().await?;
-		}
+		self.tx.take().unwrap().abort().await?;
 		// Unlock the database mutex
 		if let Some(lk) = self.lk.take() {
 			drop(lk);
@@ -90,9 +85,7 @@ impl Tx {
 		// Mark this transaction as done
 		self.ok = true;
 		// Commit the indexdb transaction
-		if self.ac {
-			self.tx.take().unwrap().commit().await?;
-		}
+		self.tx.take().unwrap().commit().await?;
 		// Unlock the database mutex
 		if let Some(lk) = self.lk.take() {
 			drop(lk);
@@ -110,8 +103,6 @@ impl Tx {
 		if self.rw == false {
 			return Err(Error::TxNotWritable);
 		}
-		// Mark this transaction as active
-		self.ac = true;
 		// Remove the key
 		self.st.as_ref().unwrap().delete(&key.convert()).await?;
 		// Return result
@@ -123,8 +114,6 @@ impl Tx {
 		if self.ok == true {
 			return Err(Error::TxClosed);
 		}
-		// Mark this transaction as active
-		self.ac = true;
 		// Check the key
 		let res = self.st.as_ref().unwrap().get(&key.convert()).await?;
 		// Return result
@@ -136,8 +125,6 @@ impl Tx {
 		if self.ok == true {
 			return Err(Error::TxClosed);
 		}
-		// Mark this transaction as active
-		self.ac = true;
 		// Get the key
 		let res = self.st.as_ref().unwrap().get(&key.convert()).await?;
 		// Return result
@@ -156,8 +143,6 @@ impl Tx {
 		if self.rw == false {
 			return Err(Error::TxNotWritable);
 		}
-		// Mark this transaction as active
-		self.ac = true;
 		// Set the key
 		self.st.as_ref().unwrap().put(&val.convert(), Some(&key.convert())).await?;
 		// Return result
@@ -173,8 +158,6 @@ impl Tx {
 		if self.rw == false {
 			return Err(Error::TxNotWritable);
 		}
-		// Mark this transaction as active
-		self.ac = true;
 		// Set the key
 		self.st.as_ref().unwrap().add(&val.convert(), Some(&key.convert())).await?;
 		// Return result
@@ -186,8 +169,6 @@ impl Tx {
 		if self.ok == true {
 			return Err(Error::TxClosed);
 		}
-		// Mark this transaction as active
-		self.ac = true;
 		// Convert the range to JavaScript
 		let rng = KeyRange::bound(&rng.start.convert(), &rng.end.convert(), false, true)?;
 		// Scan the keys
