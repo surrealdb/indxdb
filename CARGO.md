@@ -1,11 +1,8 @@
 <br>
 
 <p align="center">
-    <a href="https://github.com/surrealdb/indxdb#gh-dark-mode-only" target="_blank">
-        <img width="200" src="/img/white/logo.svg" alt="IndxDB Logo">
-    </a>
-    <a href="https://github.com/surrealdb/indxdb#gh-light-mode-only" target="_blank">
-        <img width="200" src="/img/black/logo.svg" alt="IndxDB Logo">
+    <a href="https://github.com/surrealdb/indxdb" target="_blank">
+        <img width="200" src="https://raw.githubusercontent.com/surrealdb/indxdb/master/img/logo.svg" alt="IndxDB Logo">
     </a>
 </p>
 
