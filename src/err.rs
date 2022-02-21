@@ -28,6 +28,12 @@ pub enum Error {
 	#[error("Transaction is not writable")]
 	TxNotWritable,
 
-	#[error("IndexedDB error: {0}")]
-	RexieError(#[from] rexie::Error),
+	#[error("An IndexedDB error occured: {0}")]
+	IndexedDbError(String),
+}
+
+impl From<rexie::Error> for Error {
+	fn from(v: rexie::Error) -> Self {
+		Error::IndexedDbError(v.to_string())
+	}
 }
