@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use js_sys::ArrayBuffer;
 use js_sys::Uint8Array;
 use wasm_bindgen::{JsCast, JsValue};
 
@@ -30,6 +31,10 @@ pub trait Convert<T> {
 
 impl Convert<Vec<u8>> for JsValue {
 	fn convert(self) -> Vec<u8> {
+		if self.has_type::<ArrayBuffer>() {
+			let v = Uint8Array::new(&self);
+			return v.to_vec();
+		}
 		if self.has_type::<Uint8Array>() {
 			let v: Uint8Array = self.unchecked_into();
 			return v.to_vec();
