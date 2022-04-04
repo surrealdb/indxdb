@@ -93,21 +93,6 @@ impl Tx {
 		// Continue
 		Ok(())
 	}
-	// Delete a key
-	pub async fn del(&mut self, key: Key) -> Result<(), Error> {
-		// Check to see if transaction is closed
-		if self.ok == true {
-			return Err(Error::TxClosed);
-		}
-		// Check to see if transaction is writable
-		if self.rw == false {
-			return Err(Error::TxNotWritable);
-		}
-		// Remove the key
-		self.st.as_ref().unwrap().delete(&key.convert()).await?;
-		// Return result
-		Ok(())
-	}
 	// Check if a key exists
 	pub async fn exi(&mut self, key: Key) -> Result<bool, Error> {
 		// Check to see if transaction is closed
@@ -160,6 +145,59 @@ impl Tx {
 		}
 		// Set the key
 		self.st.as_ref().unwrap().add(&val.convert(), Some(&key.convert())).await?;
+		// Return result
+		Ok(())
+	}
+	// Insert a key if it doesn't exist in the database
+	pub async fn putc(&mut self, key: Key, val: Val, chk: Option<Val>) -> Result<(), Error> {
+		// Check to see if transaction is closed
+		if self.ok == true {
+			return Err(Error::TxClosed);
+		}
+		// Check to see if transaction is writable
+		if self.rw == false {
+			return Err(Error::TxNotWritable);
+		}
+		// Set the key
+		match (self.get(key.clone()).await?, chk) {
+			(Some(v), Some(w)) if v == w => self.set(key, val).await?,
+			(None, None) => self.set(key, val).await?,
+			_ => return Err(Error::ValNotExpectedValue),
+		};
+		// Return result
+		Ok(())
+	}
+	// Delete a key
+	pub async fn del(&mut self, key: Key) -> Result<(), Error> {
+		// Check to see if transaction is closed
+		if self.ok == true {
+			return Err(Error::TxClosed);
+		}
+		// Check to see if transaction is writable
+		if self.rw == false {
+			return Err(Error::TxNotWritable);
+		}
+		// Remove the key
+		self.st.as_ref().unwrap().delete(&key.convert()).await?;
+		// Return result
+		Ok(())
+	}
+	// Delete a key
+	pub async fn delc(&mut self, key: Key, chk: Option<Val>) -> Result<(), Error> {
+		// Check to see if transaction is closed
+		if self.ok == true {
+			return Err(Error::TxClosed);
+		}
+		// Check to see if transaction is writable
+		if self.rw == false {
+			return Err(Error::TxNotWritable);
+		}
+		// Remove the key
+		match (self.get(key.clone()).await?, chk) {
+			(Some(v), Some(w)) if v == w => self.del(key).await?,
+			(None, None) => self.del(key).await?,
+			_ => return Err(Error::ValNotExpectedValue),
+		};
 		// Return result
 		Ok(())
 	}

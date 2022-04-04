@@ -28,6 +28,12 @@ pub enum Error {
 	#[error("Transaction is not writable")]
 	TxNotWritable,
 
+	#[error("Key being inserted already exists")]
+	KeyAlreadyExists,
+
+	#[error("Value being checked was not correct")]
+	ValNotExpectedValue,
+
 	#[error("An IndexedDB error occured: {0}")]
 	IndexedDbError(String),
 }
