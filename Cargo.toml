@@ -13,11 +13,11 @@ categories = ["database-implementations", "web-programming", "wasm"]
 license = "Apache-2.0"
 
 [dependencies]
-js-sys = "0.3.56"
-rexie = "0.3.0"
-thiserror = "1.0.30"
-tokio = { version = "1.17.0", features = ["sync"] }
-wasm-bindgen = { version = "0.2.79", features = ["serde-serialize"] }
+js-sys = "0.3.61"
+rexie = "0.4.2"
+thiserror = "1.0.40"
+tokio = { version = "1.26.0", features = ["sync"] }
+wasm-bindgen = { version = "0.2.84", features = ["serde-serialize"] }
 
 [dev-dependencies]
-tokio = { version = "1.17.0", features = ["rt", "macros"] }
+tokio = { version = "1.26.0", features = ["rt", "macros"] }
