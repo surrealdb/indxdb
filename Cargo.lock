@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "indxdb"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "js-sys",
  "rexie",

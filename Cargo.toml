@@ -2,7 +2,7 @@
 name = "indxdb"
 publish = true
 edition = "2021"
-version = "0.3.0"
+version = "0.4.0"
 readme = "CARGO.md"
 authors = ["Tobie Morgan Hitchcock <tobie@surrealdb.com>"]
 description = "A key-value database engine abstraction layer for IndexedDB running in WASM"
