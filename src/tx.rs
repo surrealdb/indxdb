@@ -51,10 +51,12 @@ impl Tx {
 			tx: Some(tx),
 		}
 	}
+
 	// Check if closed
 	pub fn closed(&self) -> bool {
 		self.ok
 	}
+
 	// Cancel a transaction
 	pub async fn cancel(&mut self) -> Result<(), Error> {
 		// Check to see if transaction is closed
@@ -72,6 +74,7 @@ impl Tx {
 		// Continue
 		Ok(())
 	}
+
 	// Commit a transaction
 	pub async fn commit(&mut self) -> Result<(), Error> {
 		// Check to see if transaction is closed
@@ -93,6 +96,7 @@ impl Tx {
 		// Continue
 		Ok(())
 	}
+
 	// Check if a key exists
 	pub async fn exi(&mut self, key: Key) -> Result<bool, Error> {
 		// Check to see if transaction is closed
@@ -104,6 +108,7 @@ impl Tx {
 		// Return result
 		Ok(res.is_undefined() == false)
 	}
+
 	// Fetch a key from the database
 	pub async fn get(&mut self, key: Key) -> Result<Option<Val>, Error> {
 		// Check to see if transaction is closed
@@ -118,6 +123,7 @@ impl Tx {
 			v => Ok(Some(v.convert())),
 		}
 	}
+
 	// Insert or update a key in the database
 	pub async fn set(&mut self, key: Key, val: Val) -> Result<(), Error> {
 		// Check to see if transaction is closed
@@ -133,6 +139,7 @@ impl Tx {
 		// Return result
 		Ok(())
 	}
+
 	// Insert a key if it doesn't exist in the database
 	pub async fn put(&mut self, key: Key, val: Val) -> Result<(), Error> {
 		// Check to see if transaction is closed
@@ -148,6 +155,7 @@ impl Tx {
 		// Return result
 		Ok(())
 	}
+
 	// Insert a key if it doesn't exist in the database
 	pub async fn putc(&mut self, key: Key, val: Val, chk: Option<Val>) -> Result<(), Error> {
 		// Check to see if transaction is closed
@@ -167,6 +175,7 @@ impl Tx {
 		// Return result
 		Ok(())
 	}
+
 	// Delete a key
 	pub async fn del(&mut self, key: Key) -> Result<(), Error> {
 		// Check to see if transaction is closed
@@ -182,6 +191,7 @@ impl Tx {
 		// Return result
 		Ok(())
 	}
+
 	// Delete a key
 	pub async fn delc(&mut self, key: Key, chk: Option<Val>) -> Result<(), Error> {
 		// Check to see if transaction is closed
@@ -201,7 +211,23 @@ impl Tx {
 		// Return result
 		Ok(())
 	}
+
 	// Retrieve a range of keys from the databases
+	pub async fn keys(&mut self, rng: Range<Key>, limit: u32) -> Result<Vec<Key>, Error> {
+		// Check to see if transaction is closed
+		if self.ok == true {
+			return Err(Error::TxClosed);
+		}
+		// Convert the range to JavaScript
+		let rng = KeyRange::bound(&rng.start.convert(), &rng.end.convert(), false, true)?;
+		// Scan the keys
+		let res = self.st.as_ref().unwrap().get_all(Some(&rng), Some(limit), None, None).await?;
+		let res = res.into_iter().map(|(k, _)| k.convert()).collect();
+		// Return result
+		Ok(res)
+	}
+
+	// Retrieve a range of key-value pairs from the databases
 	pub async fn scan(&mut self, rng: Range<Key>, limit: u32) -> Result<Vec<(Key, Val)>, Error> {
 		// Check to see if transaction is closed
 		if self.ok == true {
