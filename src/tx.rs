@@ -151,7 +151,10 @@ impl Tx {
 			return Err(Error::TxNotWritable);
 		}
 		// Set the key
-		self.st.as_ref().unwrap().add(&val.convert(), Some(&key.convert())).await?;
+		match self.get(key.clone()).await? {
+			None => self.set(key, val).await?,
+			_ => return Err(Error::KeyAlreadyExists),
+		};
 		// Return result
 		Ok(())
 	}
