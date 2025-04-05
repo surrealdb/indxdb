@@ -12,142 +12,128 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! This module stores the database transaction logic.
+
 use crate::err::Error;
 use crate::kv::Convert;
 use crate::kv::Key;
 use crate::kv::Val;
 use rexie::KeyRange;
 use rexie::Store;
-use rexie::Transaction;
+use rexie::Transaction as RexieTransaction;
 use std::ops::Range;
-use tokio::sync::OwnedMutexGuard;
 
-pub struct Tx {
-	// Is the transaction complete?
-	pub(crate) ok: bool,
-	// Is the transaction read+write?
-	pub(crate) rw: bool,
-	// The underlying database store
-	pub(crate) st: Option<Store>,
-	// The underlying database transaction
-	pub(crate) tx: Option<Transaction>,
-	// The underlying database write mutex
-	pub(crate) lk: Option<OwnedMutexGuard<()>>,
+/// A serializable snapshot isolated database transaction
+pub struct Transaction {
+	/// Is the transaction complete?
+	pub(crate) done: bool,
+	/// Is the transaction read+write?
+	pub(crate) write: bool,
+	/// The underlying database store
+	pub(crate) datastore: Option<Store>,
+	/// The underlying database transaction
+	pub(crate) transaction: Option<RexieTransaction>,
 }
 
-impl Tx {
-	// Create a transaction
-	pub(crate) fn new(
-		tx: Transaction,
-		st: Store,
-		write: bool,
-		guard: Option<OwnedMutexGuard<()>>,
-	) -> Tx {
-		Tx {
-			ok: false,
-			rw: write,
-			lk: guard,
-			st: Some(st),
-			tx: Some(tx),
+impl Transaction {
+	/// Create a new transaction
+	pub(crate) fn new(tx: RexieTransaction, st: Store, write: bool) -> Transaction {
+		Transaction {
+			done: false,
+			write,
+			datastore: Some(st),
+			transaction: Some(tx),
 		}
 	}
 
-	// Check if closed
+	/// Check if the transaction is closed
 	pub fn closed(&self) -> bool {
-		self.ok
+		self.done
 	}
 
-	// Cancel a transaction
+	/// Cancel the transaction and rollback any changes
 	pub async fn cancel(&mut self) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.ok == true {
+		if self.done == true {
 			return Err(Error::TxClosed);
 		}
 		// Mark this transaction as done
-		self.ok = true;
+		self.done = true;
 		// Abort the indexdb transaction
-		self.tx.take().unwrap().abort().await?;
-		// Unlock the database mutex
-		if let Some(lk) = self.lk.take() {
-			drop(lk);
-		}
+		self.transaction.take().unwrap().abort().await?;
 		// Continue
 		Ok(())
 	}
 
-	// Commit a transaction
+	/// Commit the transaction and store all changes
 	pub async fn commit(&mut self) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.ok == true {
+		if self.done == true {
 			return Err(Error::TxClosed);
 		}
 		// Check to see if transaction is writable
-		if self.rw == false {
+		if self.write == false {
 			return Err(Error::TxNotWritable);
 		}
 		// Mark this transaction as done
-		self.ok = true;
+		self.done = true;
 		// Commit the indexdb transaction
-		self.tx.take().unwrap().done().await?;
-		// Unlock the database mutex
-		if let Some(lk) = self.lk.take() {
-			drop(lk);
-		}
+		self.transaction.take().unwrap().done().await?;
 		// Continue
 		Ok(())
 	}
 
-	// Check if a key exists
-	pub async fn exi(&mut self, key: Key) -> Result<bool, Error> {
+	/// Check if a key exists in the database
+	pub async fn exists(&mut self, key: Key) -> Result<bool, Error> {
 		// Check to see if transaction is closed
-		if self.ok == true {
+		if self.done == true {
 			return Err(Error::TxClosed);
 		}
 		// Check the key
-		let res = self.st.as_ref().unwrap().get(&key.convert()).await?;
+		let res = self.datastore.as_ref().unwrap().key_exists(key.convert()).await?;
 		// Return result
-		Ok(res.is_undefined() == false)
+		Ok(res)
 	}
 
-	// Fetch a key from the database
+	/// Fetch a key from the database
 	pub async fn get(&mut self, key: Key) -> Result<Option<Val>, Error> {
 		// Check to see if transaction is closed
-		if self.ok == true {
+		if self.done == true {
 			return Err(Error::TxClosed);
 		}
 		// Get the key
-		let res = self.st.as_ref().unwrap().get(&key.convert()).await?;
+		let res = self.datastore.as_ref().unwrap().get(key.convert()).await?;
 		// Return result
 		match res {
-			v if v.is_undefined() => Ok(None),
-			v => Ok(Some(v.convert())),
+			Some(v) => Ok(Some(v.convert())),
+			None => Ok(None),
 		}
 	}
 
-	// Insert or update a key in the database
+	/// Insert or update a key in the database
 	pub async fn set(&mut self, key: Key, val: Val) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.ok == true {
+		if self.done == true {
 			return Err(Error::TxClosed);
 		}
 		// Check to see if transaction is writable
-		if self.rw == false {
+		if self.write == false {
 			return Err(Error::TxNotWritable);
 		}
 		// Set the key
-		self.st.as_ref().unwrap().put(&val.convert(), Some(&key.convert())).await?;
+		self.datastore.as_ref().unwrap().put(&val.convert(), Some(&key.convert())).await?;
 		// Return result
 		Ok(())
 	}
 
-	// Insert a key if it doesn't exist in the database
+	/// Insert a key if it doesn't exist in the database
 	pub async fn put(&mut self, key: Key, val: Val) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.ok == true {
+		if self.done == true {
 			return Err(Error::TxClosed);
 		}
 		// Check to see if transaction is writable
-		if self.rw == false {
+		if self.write == false {
 			return Err(Error::TxNotWritable);
 		}
 		// Set the key
@@ -159,14 +145,14 @@ impl Tx {
 		Ok(())
 	}
 
-	// Insert a key if it doesn't exist in the database
+	/// Insert a key if it matches a value
 	pub async fn putc(&mut self, key: Key, val: Val, chk: Option<Val>) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.ok == true {
+		if self.done == true {
 			return Err(Error::TxClosed);
 		}
 		// Check to see if transaction is writable
-		if self.rw == false {
+		if self.write == false {
 			return Err(Error::TxNotWritable);
 		}
 		// Set the key
@@ -179,30 +165,30 @@ impl Tx {
 		Ok(())
 	}
 
-	// Delete a key
+	/// Delete a key from the database
 	pub async fn del(&mut self, key: Key) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.ok == true {
+		if self.done == true {
 			return Err(Error::TxClosed);
 		}
 		// Check to see if transaction is writable
-		if self.rw == false {
+		if self.write == false {
 			return Err(Error::TxNotWritable);
 		}
 		// Remove the key
-		self.st.as_ref().unwrap().delete(&key.convert()).await?;
+		self.datastore.as_ref().unwrap().delete(key.convert()).await?;
 		// Return result
 		Ok(())
 	}
 
-	// Delete a key
+	/// Delete a key if it matches a value
 	pub async fn delc(&mut self, key: Key, chk: Option<Val>) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.ok == true {
+		if self.done == true {
 			return Err(Error::TxClosed);
 		}
 		// Check to see if transaction is writable
-		if self.rw == false {
+		if self.write == false {
 			return Err(Error::TxNotWritable);
 		}
 		// Remove the key
@@ -215,31 +201,33 @@ impl Tx {
 		Ok(())
 	}
 
-	// Retrieve a range of keys from the databases
+	/// Retrieve a range of keys from the databases
 	pub async fn keys(&mut self, rng: Range<Key>, limit: u32) -> Result<Vec<Key>, Error> {
 		// Check to see if transaction is closed
-		if self.ok == true {
+		if self.done == true {
 			return Err(Error::TxClosed);
 		}
 		// Convert the range to JavaScript
-		let rng = KeyRange::bound(&rng.start.convert(), &rng.end.convert(), false, true)?;
+		let rng = KeyRange::bound(&rng.start.convert(), &rng.end.convert(), None, Some(true));
+		let rng = rng.map_err(|e| Error::IndexedDbError(e.to_string()))?;
 		// Scan the keys
-		let res = self.st.as_ref().unwrap().get_all(Some(&rng), Some(limit), None, None).await?;
+		let res = self.datastore.as_ref().unwrap().scan(Some(rng), Some(limit), None, None).await?;
 		let res = res.into_iter().map(|(k, _)| k.convert()).collect();
 		// Return result
 		Ok(res)
 	}
 
-	// Retrieve a range of key-value pairs from the databases
+	/// Retrieve a range of key-value pairs from the databases
 	pub async fn scan(&mut self, rng: Range<Key>, limit: u32) -> Result<Vec<(Key, Val)>, Error> {
 		// Check to see if transaction is closed
-		if self.ok == true {
+		if self.done == true {
 			return Err(Error::TxClosed);
 		}
 		// Convert the range to JavaScript
-		let rng = KeyRange::bound(&rng.start.convert(), &rng.end.convert(), false, true)?;
+		let rng = KeyRange::bound(&rng.start.convert(), &rng.end.convert(), None, Some(true));
+		let rng = rng.map_err(|e| Error::IndexedDbError(e.to_string()))?;
 		// Scan the keys
-		let res = self.st.as_ref().unwrap().get_all(Some(&rng), Some(limit), None, None).await?;
+		let res = self.datastore.as_ref().unwrap().scan(Some(rng), Some(limit), None, None).await?;
 		let res = res.into_iter().map(|(k, v)| (k.convert(), v.convert())).collect();
 		// Return result
 		Ok(res)

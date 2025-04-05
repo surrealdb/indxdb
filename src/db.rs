@@ -12,48 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! This module stores the core IndexedDB database type.
+
 use crate::err::Error;
-use crate::tx::Tx;
+use crate::tx::Transaction;
 use rexie::ObjectStore;
 use rexie::Rexie;
 use rexie::TransactionMode;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
-pub struct Db {
-	pub(crate) lk: Arc<Mutex<()>>,
-	pub(crate) ds: Rexie,
+/// A transactional browser-based database
+pub struct Database {
+	/// The underlying IndexedDB datastore
+	pub(crate) datastore: Rexie,
 }
 
-// Open a new database
-pub async fn new(path: &str) -> Result<Db, Error> {
-	match Rexie::builder(path).version(1).add_object_store(ObjectStore::new("kv")).build().await {
-		Ok(db) => Ok(Db {
-			lk: Arc::new(Mutex::new(())),
-			ds: db,
-		}),
-		Err(_) => Err(Error::DbError),
+impl Database {
+	/// Create a new transactional IndexedDB database
+	pub async fn new(path: &str) -> Result<Self, Error> {
+		// Create the new object store
+		let store = ObjectStore::new("kv");
+		// Build and initialise the database
+		match Rexie::builder(path).version(1).add_object_store(store).build().await {
+			Ok(db) => Ok(Database {
+				datastore: db,
+			}),
+			Err(_) => Err(Error::DbError),
+		}
 	}
-}
 
-impl Db {
-	// Start a new transaction
-	pub async fn begin(&self, write: bool) -> Result<Tx, Error> {
-		match write {
-			true => match self.ds.transaction(&["kv"], TransactionMode::ReadWrite) {
-				Ok(tx) => match tx.store("kv") {
-					Ok(st) => Ok(Tx::new(tx, st, write, Some(self.lk.clone().lock_owned().await))),
-					Err(_) => Err(Error::TxError),
-				},
+	/// Start a new read-only or writeable transaction
+	pub async fn begin(&self, write: bool) -> Result<Transaction, Error> {
+		// Set the transaction mode
+		let mode = match write {
+			true => TransactionMode::ReadWrite,
+			false => TransactionMode::ReadOnly,
+		};
+		// Create the new transaction
+		match self.datastore.transaction(&["kv"], mode) {
+			Ok(tx) => match tx.store("kv") {
+				Ok(st) => Ok(Transaction::new(tx, st, write)),
 				Err(_) => Err(Error::TxError),
 			},
-			false => match self.ds.transaction(&["kv"], TransactionMode::ReadOnly) {
-				Ok(tx) => match tx.store("kv") {
-					Ok(st) => Ok(Tx::new(tx, st, write, None)),
-					Err(_) => Err(Error::TxError),
-				},
-				Err(_) => Err(Error::TxError),
-			},
+			Err(_) => Err(Error::TxError),
 		}
 	}
 }
