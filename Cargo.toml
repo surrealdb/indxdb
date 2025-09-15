@@ -13,11 +13,11 @@ categories = ["database-implementations", "web-programming", "wasm"]
 license = "Apache-2.0"
 
 [dependencies]
-js-sys = "0.3.77"
+js-sys = "0.3.78"
 rexie = "0.6.2"
-thiserror = "2.0.12"
-wasm-bindgen = { version = "0.2.100" }
-web-sys = "0.3.77"
+thiserror = "2.0.16"
+wasm-bindgen = { version = "0.2.101" }
+web-sys = "0.3.78"
 
 [dev-dependencies]
-tokio = { version = "1.44.1", features = ["rt", "macros"] }
+tokio = { version = "1.47.1", features = ["rt", "macros"] }
