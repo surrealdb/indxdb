@@ -18,6 +18,7 @@ use crate::err::Error;
 use crate::kv::Convert;
 use crate::kv::Key;
 use crate::kv::Val;
+use rexie::Direction;
 use rexie::KeyRange;
 use rexie::Store;
 use rexie::Transaction as RexieTransaction;
@@ -54,7 +55,7 @@ impl Transaction {
 	/// Cancel the transaction and rollback any changes
 	pub async fn cancel(&mut self) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.done == true {
+		if self.done {
 			return Err(Error::TxClosed);
 		}
 		// Mark this transaction as done
@@ -68,11 +69,11 @@ impl Transaction {
 	/// Commit the transaction and store all changes
 	pub async fn commit(&mut self) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.done == true {
+		if self.done {
 			return Err(Error::TxClosed);
 		}
 		// Check to see if transaction is writable
-		if self.write == false {
+		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
 		// Mark this transaction as done
@@ -86,7 +87,7 @@ impl Transaction {
 	/// Check if a key exists in the database
 	pub async fn exists(&mut self, key: Key) -> Result<bool, Error> {
 		// Check to see if transaction is closed
-		if self.done == true {
+		if self.done {
 			return Err(Error::TxClosed);
 		}
 		// Check the key
@@ -98,7 +99,7 @@ impl Transaction {
 	/// Fetch a key from the database
 	pub async fn get(&mut self, key: Key) -> Result<Option<Val>, Error> {
 		// Check to see if transaction is closed
-		if self.done == true {
+		if self.done {
 			return Err(Error::TxClosed);
 		}
 		// Get the key
@@ -113,11 +114,11 @@ impl Transaction {
 	/// Insert or update a key in the database
 	pub async fn set(&mut self, key: Key, val: Val) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.done == true {
+		if self.done {
 			return Err(Error::TxClosed);
 		}
 		// Check to see if transaction is writable
-		if self.write == false {
+		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
 		// Set the key
@@ -129,11 +130,11 @@ impl Transaction {
 	/// Insert a key if it doesn't exist in the database
 	pub async fn put(&mut self, key: Key, val: Val) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.done == true {
+		if self.done {
 			return Err(Error::TxClosed);
 		}
 		// Check to see if transaction is writable
-		if self.write == false {
+		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
 		// Set the key
@@ -148,11 +149,11 @@ impl Transaction {
 	/// Insert a key if it matches a value
 	pub async fn putc(&mut self, key: Key, val: Val, chk: Option<Val>) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.done == true {
+		if self.done {
 			return Err(Error::TxClosed);
 		}
 		// Check to see if transaction is writable
-		if self.write == false {
+		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
 		// Set the key
@@ -168,11 +169,11 @@ impl Transaction {
 	/// Delete a key from the database
 	pub async fn del(&mut self, key: Key) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.done == true {
+		if self.done {
 			return Err(Error::TxClosed);
 		}
 		// Check to see if transaction is writable
-		if self.write == false {
+		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
 		// Remove the key
@@ -184,11 +185,11 @@ impl Transaction {
 	/// Delete a key if it matches a value
 	pub async fn delc(&mut self, key: Key, chk: Option<Val>) -> Result<(), Error> {
 		// Check to see if transaction is closed
-		if self.done == true {
+		if self.done {
 			return Err(Error::TxClosed);
 		}
 		// Check to see if transaction is writable
-		if self.write == false {
+		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
 		// Remove the key
@@ -204,14 +205,35 @@ impl Transaction {
 	/// Retrieve a range of keys from the databases
 	pub async fn keys(&mut self, rng: Range<Key>, limit: u32) -> Result<Vec<Key>, Error> {
 		// Check to see if transaction is closed
-		if self.done == true {
+		if self.done {
 			return Err(Error::TxClosed);
 		}
+		// Get the iteration direction
+		let dir = Some(Direction::Next);
 		// Convert the range to JavaScript
 		let rng = KeyRange::bound(&rng.start.convert(), &rng.end.convert(), None, Some(true));
 		let rng = rng.map_err(|e| Error::IndexedDbError(e.to_string()))?;
 		// Scan the keys
-		let res = self.datastore.as_ref().unwrap().scan(Some(rng), Some(limit), None, None).await?;
+		let res = self.datastore.as_ref().unwrap().scan(Some(rng), Some(limit), None, dir).await?;
+		let res = res.into_iter().map(|(k, _)| k.convert()).collect();
+		// Return result
+		Ok(res)
+	}
+
+	/// Retrieve a range of keys from the databases in reverse order
+	pub async fn keysr(&mut self, rng: Range<Key>, limit: u32) -> Result<Vec<Key>, Error> {
+		// Check to see if transaction is closed
+		if self.done {
+			return Err(Error::TxClosed);
+		}
+		// Get the iteration direction
+		let dir = Some(Direction::Prev);
+		// Convert the range to JavaScript for reverse scanning
+		// For reverse order, we need to swap the start and end bounds
+		let rng = KeyRange::bound(&rng.end.convert(), &rng.start.convert(), None, Some(true));
+		let rng = rng.map_err(|e| Error::IndexedDbError(e.to_string()))?;
+		// Scan the keys in reverse order
+		let res = self.datastore.as_ref().unwrap().scan(Some(rng), Some(limit), None, dir).await?;
 		let res = res.into_iter().map(|(k, _)| k.convert()).collect();
 		// Return result
 		Ok(res)
@@ -220,14 +242,35 @@ impl Transaction {
 	/// Retrieve a range of key-value pairs from the databases
 	pub async fn scan(&mut self, rng: Range<Key>, limit: u32) -> Result<Vec<(Key, Val)>, Error> {
 		// Check to see if transaction is closed
-		if self.done == true {
+		if self.done {
 			return Err(Error::TxClosed);
 		}
+		// Get the iteration direction
+		let dir = Some(Direction::Next);
 		// Convert the range to JavaScript
 		let rng = KeyRange::bound(&rng.start.convert(), &rng.end.convert(), None, Some(true));
 		let rng = rng.map_err(|e| Error::IndexedDbError(e.to_string()))?;
 		// Scan the keys
-		let res = self.datastore.as_ref().unwrap().scan(Some(rng), Some(limit), None, None).await?;
+		let res = self.datastore.as_ref().unwrap().scan(Some(rng), Some(limit), None, dir).await?;
+		let res = res.into_iter().map(|(k, v)| (k.convert(), v.convert())).collect();
+		// Return result
+		Ok(res)
+	}
+
+	/// Retrieve a range of key-value pairs from the databases in reverse order
+	pub async fn scanr(&mut self, rng: Range<Key>, limit: u32) -> Result<Vec<(Key, Val)>, Error> {
+		// Check to see if transaction is closed
+		if self.done {
+			return Err(Error::TxClosed);
+		}
+		// Get the iteration direction
+		let dir = Some(Direction::Prev);
+		// Convert the range to JavaScript for reverse scanning
+		// For reverse order, we need to swap the start and end bounds
+		let rng = KeyRange::bound(&rng.end.convert(), &rng.start.convert(), None, Some(true));
+		let rng = rng.map_err(|e| Error::IndexedDbError(e.to_string()))?;
+		// Scan the keys in reverse order
+		let res = self.datastore.as_ref().unwrap().scan(Some(rng), Some(limit), None, dir).await?;
 		let res = res.into_iter().map(|(k, v)| (k.convert(), v.convert())).collect();
 		// Return result
 		Ok(res)
