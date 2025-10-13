@@ -18,6 +18,8 @@ use crate::err::Error;
 use crate::kv::Convert;
 use crate::kv::Key;
 use crate::kv::Val;
+use crate::sp::Operation;
+use crate::sp::Savepoint;
 use rexie::Direction;
 use rexie::KeyRange;
 use rexie::Store;
@@ -34,6 +36,10 @@ pub struct Transaction {
 	pub(crate) datastore: Option<Store>,
 	/// The underlying database transaction
 	pub(crate) transaction: Option<RexieTransaction>,
+	/// Stack of savepoints for nested rollback support
+	pub(crate) savepoints: Vec<Savepoint>,
+	/// Current undo operations since the last savepoint
+	pub(crate) operations: Vec<Operation>,
 }
 
 impl Transaction {
@@ -44,6 +50,8 @@ impl Transaction {
 			write,
 			datastore: Some(st),
 			transaction: Some(tx),
+			savepoints: Vec::new(),
+			operations: Vec::new(),
 		}
 	}
 
@@ -121,6 +129,20 @@ impl Transaction {
 		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
+		// Record operation if we have savepoints
+		if !self.savepoints.is_empty() || !self.operations.is_empty() {
+			// Check if key already exists to determine undo operation
+			match self.get(key.clone()).await? {
+				Some(existing_val) => {
+					// Key exists, record operation to restore old value
+					self.operations.push(Operation::RestoreValue(key.clone(), existing_val));
+				}
+				None => {
+					// Key doesn't exist, record operation to delete it
+					self.operations.push(Operation::DeleteKey(key.clone()));
+				}
+			}
+		}
 		// Set the key
 		self.datastore.as_ref().unwrap().put(&val.convert(), Some(&key.convert())).await?;
 		// Return result
@@ -175,6 +197,14 @@ impl Transaction {
 		// Check to see if transaction is writable
 		if !self.write {
 			return Err(Error::TxNotWritable);
+		}
+		// Record operation if we have savepoints
+		if !self.savepoints.is_empty() || !self.operations.is_empty() {
+			// Check if key exists to record restoration operation
+			if let Some(existing_val) = self.get(key.clone()).await? {
+				// Key exists, record operation to restore it
+				self.operations.push(Operation::RestoreDeleted(key.clone(), existing_val));
+			}
 		}
 		// Remove the key
 		self.datastore.as_ref().unwrap().delete(key.convert()).await?;
@@ -274,5 +304,77 @@ impl Transaction {
 		let res = res.into_iter().map(|(k, v)| (k.convert(), v.convert())).collect();
 		// Return result
 		Ok(res)
+	}
+
+	/// Set a savepoint in the transaction for partial rollback
+	/// This method is stackable and can be called multiple times with
+	/// corresponding calls to `rollback_to_savepoint`
+	pub async fn set_savepoint(&mut self) -> Result<(), Error> {
+		// Check to see if transaction is closed
+		if self.done {
+			return Err(Error::TxClosed);
+		}
+		// Check to see if transaction is writable
+		if !self.write {
+			return Err(Error::TxNotWritable);
+		}
+		// Create a new savepoint with current operations
+		self.savepoints.push(Savepoint {
+			operations: self.operations.clone(),
+		});
+		// Clear current operations for the next savepoint
+		self.operations.clear();
+		// Continue
+		Ok(())
+	}
+
+	/// Rollback the transaction to the most recently set savepoint
+	/// After calling this method, subsequent modifications within this
+	/// transaction can be rolled back by calling `rollback_to_savepoint`
+	/// again if there are more savepoints in the stack
+	pub async fn rollback_to_savepoint(&mut self) -> Result<(), Error> {
+		// Check to see if transaction is closed
+		if self.done {
+			return Err(Error::TxClosed);
+		}
+		// Check to see if transaction is writable
+		if !self.write {
+			return Err(Error::TxNotWritable);
+		}
+		// Check if there are any savepoints
+		if self.savepoints.is_empty() {
+			return Err(Error::NoSavepoint);
+		}
+		// Get the most recent savepoint
+		let savepoint = self.savepoints.pop().unwrap();
+		// Execute undo operations in reverse order
+		for op in self.operations.iter().rev() {
+			match op {
+				// Delete the key that was inserted
+				Operation::DeleteKey(key) => {
+					self.datastore.as_ref().unwrap().delete(key.clone().convert()).await?;
+				}
+				// Restore the previous value
+				Operation::RestoreValue(key, val) => {
+					self.datastore
+						.as_ref()
+						.unwrap()
+						.put(&val.clone().convert(), Some(&key.clone().convert()))
+						.await?;
+				}
+				// Restore the deleted key
+				Operation::RestoreDeleted(key, val) => {
+					self.datastore
+						.as_ref()
+						.unwrap()
+						.put(&val.clone().convert(), Some(&key.clone().convert()))
+						.await?;
+				}
+			}
+		}
+		// Restore the savepoint's operations as the current ones
+		self.operations = savepoint.operations;
+		// Continue
+		Ok(())
 	}
 }

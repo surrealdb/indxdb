@@ -37,6 +37,10 @@ pub enum Error {
 	#[error("Value being checked was not correct")]
 	ValNotExpectedValue,
 
+	/// No savepoint has been set.
+	#[error("No savepoint has been set")]
+	NoSavepoint,
+
 	#[error("An IndexedDB error occured: {0}")]
 	IndexedDbError(String),
 }
