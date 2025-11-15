@@ -320,10 +320,8 @@ impl Transaction {
 		}
 		// Create a new savepoint with current operations
 		self.savepoints.push(Savepoint {
-			operations: self.operations.clone(),
+			operations: std::mem::take(&mut self.operations),
 		});
-		// Clear current operations for the next savepoint
-		self.operations.clear();
 		// Continue
 		Ok(())
 	}
