@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod db;
-pub mod err;
-pub mod kv;
-pub mod sp;
-pub mod tx;
+mod db;
+mod err;
+mod kv;
+mod sp;
+mod tx;
 
-pub use self::db::*;
-pub use self::err::*;
-pub use self::kv::*;
-pub use self::tx::*;
+pub use db::Database;
+pub use err::Error;
+pub use kv::Key;
+pub use kv::Kv;
+pub use kv::Val;
+pub use tx::Transaction;

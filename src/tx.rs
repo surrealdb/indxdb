@@ -93,7 +93,7 @@ impl Transaction {
 	}
 
 	/// Check if a key exists in the database
-	pub async fn exists(&mut self, key: Key) -> Result<bool, Error> {
+	pub async fn exists(&self, key: Key) -> Result<bool, Error> {
 		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
@@ -105,7 +105,7 @@ impl Transaction {
 	}
 
 	/// Fetch a key from the database
-	pub async fn get(&mut self, key: Key) -> Result<Option<Val>, Error> {
+	pub async fn get(&self, key: Key) -> Result<Option<Val>, Error> {
 		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
@@ -233,7 +233,7 @@ impl Transaction {
 	}
 
 	/// Retrieve a range of keys from the databases
-	pub async fn keys(&mut self, rng: Range<Key>, limit: u32) -> Result<Vec<Key>, Error> {
+	pub async fn keys(&self, rng: Range<Key>, limit: u32) -> Result<Vec<Key>, Error> {
 		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
@@ -251,7 +251,7 @@ impl Transaction {
 	}
 
 	/// Retrieve a range of keys from the databases in reverse order
-	pub async fn keysr(&mut self, rng: Range<Key>, limit: u32) -> Result<Vec<Key>, Error> {
+	pub async fn keysr(&self, rng: Range<Key>, limit: u32) -> Result<Vec<Key>, Error> {
 		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
@@ -270,7 +270,7 @@ impl Transaction {
 	}
 
 	/// Retrieve a range of key-value pairs from the databases
-	pub async fn scan(&mut self, rng: Range<Key>, limit: u32) -> Result<Vec<(Key, Val)>, Error> {
+	pub async fn scan(&self, rng: Range<Key>, limit: u32) -> Result<Vec<(Key, Val)>, Error> {
 		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
@@ -288,7 +288,7 @@ impl Transaction {
 	}
 
 	/// Retrieve a range of key-value pairs from the databases in reverse order
-	pub async fn scanr(&mut self, rng: Range<Key>, limit: u32) -> Result<Vec<(Key, Val)>, Error> {
+	pub async fn scanr(&self, rng: Range<Key>, limit: u32) -> Result<Vec<(Key, Val)>, Error> {
 		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
