@@ -14,46 +14,39 @@
 
 //! This module stores the core IndexedDB database type.
 
+use std::rc::Rc;
+
 use crate::err::Error;
 use crate::tx::Transaction;
 use rexie::ObjectStore;
 use rexie::Rexie;
-use rexie::TransactionMode;
 
 /// A transactional browser-based database
 pub struct Database {
-	/// The underlying IndexedDB datastore
-	pub(crate) datastore: Rexie,
+	/// The underlying IndexedDB datastore, wrapped in Rc so transactions can
+	/// hold a reference for opening fresh IDB transactions.
+	pub(crate) datastore: Rc<Rexie>,
 }
 
 impl Database {
 	/// Create a new transactional IndexedDB database
 	pub async fn new(path: &str) -> Result<Self, Error> {
-		// Create the new object store
 		let store = ObjectStore::new("kv");
-		// Build and initialise the database
 		match Rexie::builder(path).version(1).add_object_store(store).build().await {
 			Ok(db) => Ok(Database {
-				datastore: db,
+				datastore: Rc::new(db),
 			}),
 			Err(_) => Err(Error::DbError),
 		}
 	}
 
-	/// Start a new read-only or writeable transaction
+	/// Start a new transaction.
+	///
+	/// The returned transaction buffers all writes in memory. Reads open
+	/// short-lived read-only IDB transactions on demand. On `commit()`, a
+	/// fresh read-write IDB transaction is opened and all buffered mutations
+	/// are flushed in one synchronous batch.
 	pub async fn begin(&self, write: bool) -> Result<Transaction, Error> {
-		// Set the transaction mode
-		let mode = match write {
-			true => TransactionMode::ReadWrite,
-			false => TransactionMode::ReadOnly,
-		};
-		// Create the new transaction
-		match self.datastore.transaction(&["kv"], mode) {
-			Ok(tx) => match tx.store("kv") {
-				Ok(st) => Ok(Transaction::new(tx, st, write)),
-				Err(_) => Err(Error::TxError),
-			},
-			Err(_) => Err(Error::TxError),
-		}
+		Ok(Transaction::new(Rc::clone(&self.datastore), write))
 	}
 }
