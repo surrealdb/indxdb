@@ -12,7 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! This module stores the database transaction logic.
+//! Buffered transaction layer for IndexedDB.
+//!
+//! IndexedDB auto-commits a transaction whenever the event loop is idle and
+//! there are no pending requests. Rust async/await yields to the JS event loop
+//! on every `.await`, so multiple IDB operations within a single Rexie
+//! transaction will cause `TransactionInactiveError` as soon as the second
+//! request fires after an idle microtask checkpoint.
+//!
+//! To work around this, we split the transaction into two phases:
+//!
+//! 1. **Read phase** – each read opens a fresh, short-lived read-only IDB
+//!    transaction. This is safe because reads are idempotent and a potential
+//!    auto-commit between reads is harmless. Reads also consult a `BTreeMap`
+//!    write-buffer so that read-your-own-writes works correctly.
+//!
+//! 2. **Flush phase** (`commit`) – a *new* read-write IDB transaction is
+//!    opened and every buffered mutation is dispatched. Puts use `put_all`
+//!    which fires all IDB requests synchronously without any `.await` between
+//!    them. Deletes are issued sequentially (each awaited), which is safe
+//!    because the Rust executor polls the next delete in the same microtask
+//!    as the previous completion callback. Finally, `transaction.done()` is
+//!    awaited, which resolves when IDB has durably committed everything.
 
 use crate::err::Error;
 use crate::kv::Convert;
@@ -22,357 +43,439 @@ use crate::sp::Operation;
 use crate::sp::Savepoint;
 use rexie::Direction;
 use rexie::KeyRange;
+use rexie::Rexie;
 use rexie::Store;
-use rexie::Transaction as RexieTransaction;
+use rexie::TransactionMode;
+use std::collections::BTreeMap;
 use std::ops::Range;
+use std::rc::Rc;
+use wasm_bindgen::JsValue;
 
-/// A serializable snapshot isolated database transaction
+#[derive(Clone, Debug)]
+pub(crate) enum Buffered {
+	Set(Val),
+	Del,
+}
+
+/// A serializable snapshot isolated database transaction.
+///
+/// All mutations are buffered in-memory. On `commit()` they are flushed to
+/// IndexedDB in a single synchronous batch so that the IDB transaction never
+/// goes idle between requests.
 pub struct Transaction {
-	/// Is the transaction complete?
 	pub(crate) done: bool,
-	/// Is the transaction read+write?
 	pub(crate) write: bool,
-	/// The underlying database store
-	pub(crate) datastore: Option<Store>,
-	/// The underlying database transaction
-	pub(crate) transaction: Option<RexieTransaction>,
-	/// Stack of savepoints for nested rollback support
+	/// Shared reference to the Rexie database for opening new IDB transactions.
+	pub(crate) db: Rc<Rexie>,
+	/// Buffered mutations: key -> Set(val) | Del
+	pub(crate) buffer: BTreeMap<Key, Buffered>,
 	pub(crate) savepoints: Vec<Savepoint>,
-	/// Current undo operations since the last savepoint
 	pub(crate) operations: Vec<Operation>,
 }
 
 impl Transaction {
-	/// Create a new transaction
-	pub(crate) fn new(tx: RexieTransaction, st: Store, write: bool) -> Transaction {
+	pub(crate) fn new(db: Rc<Rexie>, write: bool) -> Transaction {
 		Transaction {
 			done: false,
 			write,
-			datastore: Some(st),
-			transaction: Some(tx),
+			db,
+			buffer: BTreeMap::new(),
 			savepoints: Vec::new(),
 			operations: Vec::new(),
 		}
 	}
 
-	/// Check if the transaction is closed
 	pub fn closed(&self) -> bool {
 		self.done
 	}
 
-	/// Cancel the transaction and rollback any changes
+	/// Open a fresh read-only IDB store for a single read request.
+	fn fresh_read_store(&self) -> Result<Store, Error> {
+		let tx = self.db.transaction(&["kv"], TransactionMode::ReadOnly)
+			.map_err(|_| Error::TxError)?;
+		tx.store("kv").map_err(|_| Error::TxError)
+	}
+
+	/// Read a key, checking the write buffer first.
+	async fn buffered_get(&self, key: &Key) -> Result<Option<Val>, Error> {
+		match self.buffer.get(key) {
+			Some(Buffered::Set(v)) => Ok(Some(v.clone())),
+			Some(Buffered::Del) => Ok(None),
+			None => {
+				let store = self.fresh_read_store()?;
+				let res = store.get(key.clone().convert()).await?;
+				match res {
+					Some(v) => Ok(Some(v.convert())),
+					None => Ok(None),
+				}
+			}
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// Transaction lifecycle
+	// ------------------------------------------------------------------
+
 	pub async fn cancel(&mut self) -> Result<(), Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Mark this transaction as done
 		self.done = true;
-		// Abort the indexdb transaction
-		self.transaction.take().unwrap().abort().await?;
-		// Continue
+		self.buffer.clear();
 		Ok(())
 	}
 
-	/// Commit the transaction and store all changes
+	/// Commit: flush all buffered writes to IndexedDB in one atomic batch.
+	///
+	/// Opens a fresh read-write IDB transaction. Puts are batched via
+	/// `put_all` (all IDB requests fired synchronously, only the last
+	/// awaited). Deletes are issued sequentially -- each `await` is safe
+	/// because the next `delete()` call is queued in the same microtask
+	/// as the previous request's completion, keeping the transaction alive.
 	pub async fn commit(&mut self) -> Result<(), Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Check to see if transaction is writable
 		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
-		// Mark this transaction as done
 		self.done = true;
-		// Commit the indexdb transaction
-		self.transaction.take().unwrap().done().await?;
-		// Continue
+
+		if self.buffer.is_empty() {
+			return Ok(());
+		}
+
+		let flush_tx = self.db.transaction(&["kv"], TransactionMode::ReadWrite)
+			.map_err(|_| Error::TxError)?;
+		let flush_store = flush_tx.store("kv").map_err(|_| Error::TxError)?;
+
+		// Build an iterator of (JsValue, Option<JsValue>) for put_all, and
+		// collect deletes separately.
+		let buffer = std::mem::take(&mut self.buffer);
+
+		let mut puts: Vec<(JsValue, Option<JsValue>)> = Vec::new();
+		let mut deletes: Vec<JsValue> = Vec::new();
+
+		for (key, op) in buffer {
+			let js_key: JsValue = key.convert();
+			match op {
+				Buffered::Set(val) => {
+					let js_val: JsValue = val.convert();
+					puts.push((js_val, Some(js_key)));
+				}
+				Buffered::Del => {
+					deletes.push(js_key);
+				}
+			}
+		}
+
+		// Use put_all which fires all IDB requests synchronously (no .await
+		// between them) and only awaits the last request's result.
+		if !puts.is_empty() {
+			flush_store.put_all(puts.into_iter()).await?;
+		}
+
+		// Delete all keys. Each `Store::delete` awaits one IDB request,
+		// but this is safe: completing request N immediately queues
+		// request N+1 within the same microtask (wasm_bindgen_futures
+		// polls continuations synchronously in the IDB callback), so
+		// the transaction always has a pending request and never
+		// auto-commits. This is the same pattern rexie's `scan` uses
+		// internally when iterating a cursor.
+		for js_key in deletes {
+			flush_store.delete(js_key).await?;
+		}
+
+		// Wait for the IDB transaction to durably commit everything.
+		flush_tx.done().await?;
+
 		Ok(())
 	}
 
-	/// Check if a key exists in the database
+	// ------------------------------------------------------------------
+	// Reads
+	// ------------------------------------------------------------------
+
 	pub async fn exists(&self, key: Key) -> Result<bool, Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Check the key
-		let res = self.datastore.as_ref().unwrap().key_exists(key.convert()).await?;
-		// Return result
-		Ok(res)
+		match self.buffer.get(&key) {
+			Some(Buffered::Set(_)) => Ok(true),
+			Some(Buffered::Del) => Ok(false),
+			None => {
+				let store = self.fresh_read_store()?;
+				let res = store.key_exists(key.convert()).await?;
+				Ok(res)
+			}
+		}
 	}
 
-	/// Fetch a key from the database
 	pub async fn get(&self, key: Key) -> Result<Option<Val>, Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Get the key
-		let res = self.datastore.as_ref().unwrap().get(key.convert()).await?;
-		// Return result
-		match res {
-			Some(v) => Ok(Some(v.convert())),
-			None => Ok(None),
-		}
+		self.buffered_get(&key).await
 	}
 
-	/// Insert or update a key in the database
+	// ------------------------------------------------------------------
+	// Writes (buffered)
+	// ------------------------------------------------------------------
+
 	pub async fn set(&mut self, key: Key, val: Val) -> Result<(), Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Check to see if transaction is writable
 		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
-		// Record operation if we have savepoints
 		if !self.savepoints.is_empty() || !self.operations.is_empty() {
-			// Check if key already exists to determine undo operation
-			match self.get(key.clone()).await? {
+			match self.buffered_get(&key).await? {
 				Some(existing_val) => {
-					// Key exists, record operation to restore old value
 					self.operations.push(Operation::RestoreValue(key.clone(), existing_val));
 				}
 				None => {
-					// Key doesn't exist, record operation to delete it
 					self.operations.push(Operation::DeleteKey(key.clone()));
 				}
 			}
 		}
-		// Set the key
-		self.datastore.as_ref().unwrap().put(&val.convert(), Some(&key.convert())).await?;
-		// Return result
+		self.buffer.insert(key, Buffered::Set(val));
 		Ok(())
 	}
 
-	/// Insert a key if it doesn't exist in the database
 	pub async fn put(&mut self, key: Key, val: Val) -> Result<(), Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Check to see if transaction is writable
 		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
-		// Set the key
-		match self.get(key.clone()).await? {
-			None => self.set(key, val).await?,
-			_ => return Err(Error::KeyAlreadyExists),
-		};
-		// Return result
-		Ok(())
+		match self.buffered_get(&key).await? {
+			None => self.set(key, val).await,
+			_ => Err(Error::KeyAlreadyExists),
+		}
 	}
 
-	/// Insert a key if it matches a value
 	pub async fn putc(&mut self, key: Key, val: Val, chk: Option<Val>) -> Result<(), Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Check to see if transaction is writable
 		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
-		// Set the key
-		match (self.get(key.clone()).await?, chk) {
-			(Some(v), Some(w)) if v == w => self.set(key, val).await?,
-			(None, None) => self.set(key, val).await?,
-			_ => return Err(Error::ValNotExpectedValue),
-		};
-		// Return result
-		Ok(())
+		match (self.buffered_get(&key).await?, chk) {
+			(Some(v), Some(w)) if v == w => self.set(key, val).await,
+			(None, None) => self.set(key, val).await,
+			_ => Err(Error::ValNotExpectedValue),
+		}
 	}
 
-	/// Delete a key from the database
 	pub async fn del(&mut self, key: Key) -> Result<(), Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Check to see if transaction is writable
 		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
-		// Record operation if we have savepoints
 		if !self.savepoints.is_empty() || !self.operations.is_empty() {
-			// Check if key exists to record restoration operation
-			if let Some(existing_val) = self.get(key.clone()).await? {
-				// Key exists, record operation to restore it
+			if let Some(existing_val) = self.buffered_get(&key).await? {
 				self.operations.push(Operation::RestoreDeleted(key.clone(), existing_val));
 			}
 		}
-		// Remove the key
-		self.datastore.as_ref().unwrap().delete(key.convert()).await?;
-		// Return result
+		self.buffer.insert(key, Buffered::Del);
 		Ok(())
 	}
 
-	/// Delete a key if it matches a value
 	pub async fn delc(&mut self, key: Key, chk: Option<Val>) -> Result<(), Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Check to see if transaction is writable
 		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
-		// Remove the key
-		match (self.get(key.clone()).await?, chk) {
-			(Some(v), Some(w)) if v == w => self.del(key).await?,
-			(None, None) => self.del(key).await?,
-			_ => return Err(Error::ValNotExpectedValue),
-		};
-		// Return result
-		Ok(())
+		match (self.buffered_get(&key).await?, chk) {
+			(Some(v), Some(w)) if v == w => self.del(key).await,
+			(None, None) => self.del(key).await,
+			_ => Err(Error::ValNotExpectedValue),
+		}
 	}
 
-	/// Retrieve a range of keys from the databases
+	// ------------------------------------------------------------------
+	// Range operations – merge IDB results with the write buffer
+	// ------------------------------------------------------------------
+
 	pub async fn keys(&self, rng: Range<Key>, limit: u32) -> Result<Vec<Key>, Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Get the iteration direction
+		let Range { start, end } = rng;
 		let dir = Some(Direction::Next);
-		// Convert the range to JavaScript
-		let rng = KeyRange::bound(&rng.start.convert(), &rng.end.convert(), None, Some(true));
-		let rng = rng.map_err(|e| Error::IndexedDbError(e.to_string()))?;
-		// Scan the keys
-		let res = self.datastore.as_ref().unwrap().scan(Some(rng), Some(limit), None, dir).await?;
-		let res = res.into_iter().map(|(k, _)| k.convert()).collect();
-		// Return result
+		let kr = KeyRange::bound(&start.clone().convert(), &end.clone().convert(), None, Some(true));
+		let kr = kr.map_err(|e| Error::IndexedDbError(e.to_string()))?;
+
+		let store = self.fresh_read_store()?;
+		let idb_results = store.scan(Some(kr), Some(limit), None, dir).await?;
+
+		let mut merged: BTreeMap<Key, ()> = BTreeMap::new();
+		for (k, _) in idb_results {
+			let key: Key = k.convert();
+			match self.buffer.get(&key) {
+				Some(Buffered::Del) => {}
+				_ => { merged.insert(key, ()); }
+			}
+		}
+		for (key, op) in self.buffer.range(start..end) {
+			match op {
+				Buffered::Set(_) => { merged.insert(key.clone(), ()); }
+				Buffered::Del => { merged.remove(key); }
+			}
+		}
+
+		let res: Vec<Key> = merged.into_keys().take(limit as usize).collect();
 		Ok(res)
 	}
 
-	/// Retrieve a range of keys from the databases in reverse order
 	pub async fn keysr(&self, rng: Range<Key>, limit: u32) -> Result<Vec<Key>, Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Get the iteration direction
+		let Range { start, end } = rng;
 		let dir = Some(Direction::Prev);
-		// Convert the range to JavaScript for reverse scanning
-		// For reverse order, we need to swap the start and end bounds
-		let rng = KeyRange::bound(&rng.end.convert(), &rng.start.convert(), None, Some(true));
-		let rng = rng.map_err(|e| Error::IndexedDbError(e.to_string()))?;
-		// Scan the keys in reverse order
-		let res = self.datastore.as_ref().unwrap().scan(Some(rng), Some(limit), None, dir).await?;
-		let res = res.into_iter().map(|(k, _)| k.convert()).collect();
-		// Return result
+		let kr = KeyRange::bound(&end.clone().convert(), &start.clone().convert(), None, Some(true));
+		let kr = kr.map_err(|e| Error::IndexedDbError(e.to_string()))?;
+
+		let store = self.fresh_read_store()?;
+		let idb_results = store.scan(Some(kr), Some(limit), None, dir).await?;
+
+		let mut merged: BTreeMap<Key, ()> = BTreeMap::new();
+		for (k, _) in idb_results {
+			let key: Key = k.convert();
+			match self.buffer.get(&key) {
+				Some(Buffered::Del) => {}
+				_ => { merged.insert(key, ()); }
+			}
+		}
+		for (key, op) in self.buffer.range(start..end) {
+			match op {
+				Buffered::Set(_) => { merged.insert(key.clone(), ()); }
+				Buffered::Del => { merged.remove(key); }
+			}
+		}
+
+		let res: Vec<Key> = merged.into_keys().rev().take(limit as usize).collect();
 		Ok(res)
 	}
 
-	/// Retrieve a range of key-value pairs from the databases
 	pub async fn scan(&self, rng: Range<Key>, limit: u32) -> Result<Vec<(Key, Val)>, Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Get the iteration direction
+		let Range { start, end } = rng;
 		let dir = Some(Direction::Next);
-		// Convert the range to JavaScript
-		let rng = KeyRange::bound(&rng.start.convert(), &rng.end.convert(), None, Some(true));
-		let rng = rng.map_err(|e| Error::IndexedDbError(e.to_string()))?;
-		// Scan the keys
-		let res = self.datastore.as_ref().unwrap().scan(Some(rng), Some(limit), None, dir).await?;
-		let res = res.into_iter().map(|(k, v)| (k.convert(), v.convert())).collect();
-		// Return result
+		let kr = KeyRange::bound(&start.clone().convert(), &end.clone().convert(), None, Some(true));
+		let kr = kr.map_err(|e| Error::IndexedDbError(e.to_string()))?;
+
+		let store = self.fresh_read_store()?;
+		let idb_results = store.scan(Some(kr), Some(limit), None, dir).await?;
+
+		let mut merged: BTreeMap<Key, Val> = BTreeMap::new();
+		for (k, v) in idb_results {
+			let key: Key = k.convert();
+			let val: Val = v.convert();
+			match self.buffer.get(&key) {
+				Some(Buffered::Del) => {}
+				Some(Buffered::Set(bv)) => { merged.insert(key, bv.clone()); }
+				None => { merged.insert(key, val); }
+			}
+		}
+		for (key, op) in self.buffer.range(start..end) {
+			match op {
+				Buffered::Set(v) => { merged.insert(key.clone(), v.clone()); }
+				Buffered::Del => { merged.remove(key); }
+			}
+		}
+
+		let res: Vec<(Key, Val)> = merged.into_iter().take(limit as usize).collect();
 		Ok(res)
 	}
 
-	/// Retrieve a range of key-value pairs from the databases in reverse order
 	pub async fn scanr(&self, rng: Range<Key>, limit: u32) -> Result<Vec<(Key, Val)>, Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Get the iteration direction
+		let Range { start, end } = rng;
 		let dir = Some(Direction::Prev);
-		// Convert the range to JavaScript for reverse scanning
-		// For reverse order, we need to swap the start and end bounds
-		let rng = KeyRange::bound(&rng.end.convert(), &rng.start.convert(), None, Some(true));
-		let rng = rng.map_err(|e| Error::IndexedDbError(e.to_string()))?;
-		// Scan the keys in reverse order
-		let res = self.datastore.as_ref().unwrap().scan(Some(rng), Some(limit), None, dir).await?;
-		let res = res.into_iter().map(|(k, v)| (k.convert(), v.convert())).collect();
-		// Return result
+		let kr = KeyRange::bound(&end.clone().convert(), &start.clone().convert(), None, Some(true));
+		let kr = kr.map_err(|e| Error::IndexedDbError(e.to_string()))?;
+
+		let store = self.fresh_read_store()?;
+		let idb_results = store.scan(Some(kr), Some(limit), None, dir).await?;
+
+		let mut merged: BTreeMap<Key, Val> = BTreeMap::new();
+		for (k, v) in idb_results {
+			let key: Key = k.convert();
+			let val: Val = v.convert();
+			match self.buffer.get(&key) {
+				Some(Buffered::Del) => {}
+				Some(Buffered::Set(bv)) => { merged.insert(key, bv.clone()); }
+				None => { merged.insert(key, val); }
+			}
+		}
+		for (key, op) in self.buffer.range(start..end) {
+			match op {
+				Buffered::Set(v) => { merged.insert(key.clone(), v.clone()); }
+				Buffered::Del => { merged.remove(key); }
+			}
+		}
+
+		let res: Vec<(Key, Val)> = merged.into_iter().rev().take(limit as usize).collect();
 		Ok(res)
 	}
 
-	/// Set a savepoint in the transaction for partial rollback
-	/// This method is stackable and can be called multiple times with
-	/// corresponding calls to `rollback_to_savepoint`
+	// ------------------------------------------------------------------
+	// Savepoints
+	// ------------------------------------------------------------------
+
 	pub async fn set_savepoint(&mut self) -> Result<(), Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Check to see if transaction is writable
 		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
-		// Create a new savepoint with current operations
 		self.savepoints.push(Savepoint {
 			operations: std::mem::take(&mut self.operations),
 		});
-		// Continue
 		Ok(())
 	}
 
-	/// Rollback the transaction to the most recently set savepoint
-	/// After calling this method, subsequent modifications within this
-	/// transaction can be rolled back by calling `rollback_to_savepoint`
-	/// again if there are more savepoints in the stack
+	/// Rollback to the most recent savepoint by replaying undo operations
+	/// against the in-memory buffer. No IDB calls needed.
 	pub async fn rollback_to_savepoint(&mut self) -> Result<(), Error> {
-		// Check to see if transaction is closed
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		// Check to see if transaction is writable
 		if !self.write {
 			return Err(Error::TxNotWritable);
 		}
-		// Check if there are any savepoints
 		if self.savepoints.is_empty() {
 			return Err(Error::NoSavepoint);
 		}
-		// Get the most recent savepoint
 		let savepoint = self.savepoints.pop().unwrap();
-		// Execute undo operations in reverse order
 		for op in self.operations.iter().rev() {
 			match op {
-				// Delete the key that was inserted
 				Operation::DeleteKey(key) => {
-					self.datastore.as_ref().unwrap().delete(key.clone().convert()).await?;
+					self.buffer.remove(key);
 				}
-				// Restore the previous value
 				Operation::RestoreValue(key, val) => {
-					self.datastore
-						.as_ref()
-						.unwrap()
-						.put(&val.clone().convert(), Some(&key.clone().convert()))
-						.await?;
+					self.buffer.insert(key.clone(), Buffered::Set(val.clone()));
 				}
-				// Restore the deleted key
 				Operation::RestoreDeleted(key, val) => {
-					self.datastore
-						.as_ref()
-						.unwrap()
-						.put(&val.clone().convert(), Some(&key.clone().convert()))
-						.await?;
+					self.buffer.insert(key.clone(), Buffered::Set(val.clone()));
 				}
 			}
 		}
-		// Restore the savepoint's operations as the current ones
 		self.operations = savepoint.operations;
-		// Continue
 		Ok(())
 	}
 }
