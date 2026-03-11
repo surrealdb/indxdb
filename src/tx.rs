@@ -91,8 +91,8 @@ impl Transaction {
 
 	/// Open a fresh read-only IDB store for a single read request.
 	fn fresh_read_store(&self) -> Result<Store, Error> {
-		let tx = self.db.transaction(&["kv"], TransactionMode::ReadOnly)
-			.map_err(|_| Error::TxError)?;
+		let tx =
+			self.db.transaction(&["kv"], TransactionMode::ReadOnly).map_err(|_| Error::TxError)?;
 		tx.store("kv").map_err(|_| Error::TxError)
 	}
 
@@ -145,8 +145,8 @@ impl Transaction {
 			return Ok(());
 		}
 
-		let flush_tx = self.db.transaction(&["kv"], TransactionMode::ReadWrite)
-			.map_err(|_| Error::TxError)?;
+		let flush_tx =
+			self.db.transaction(&["kv"], TransactionMode::ReadWrite).map_err(|_| Error::TxError)?;
 		let flush_store = flush_tx.store("kv").map_err(|_| Error::TxError)?;
 
 		// Build an iterator of (JsValue, Option<JsValue>) for put_all, and
@@ -308,9 +308,13 @@ impl Transaction {
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		let Range { start, end } = rng;
+		let Range {
+			start,
+			end,
+		} = rng;
 		let dir = Some(Direction::Next);
-		let kr = KeyRange::bound(&start.clone().convert(), &end.clone().convert(), None, Some(true));
+		let kr =
+			KeyRange::bound(&start.clone().convert(), &end.clone().convert(), None, Some(true));
 		let kr = kr.map_err(|e| Error::IndexedDbError(e.to_string()))?;
 
 		let store = self.fresh_read_store()?;
@@ -321,13 +325,19 @@ impl Transaction {
 			let key: Key = k.convert();
 			match self.buffer.get(&key) {
 				Some(Buffered::Del) => {}
-				_ => { merged.insert(key, ()); }
+				_ => {
+					merged.insert(key, ());
+				}
 			}
 		}
 		for (key, op) in self.buffer.range(start..end) {
 			match op {
-				Buffered::Set(_) => { merged.insert(key.clone(), ()); }
-				Buffered::Del => { merged.remove(key); }
+				Buffered::Set(_) => {
+					merged.insert(key.clone(), ());
+				}
+				Buffered::Del => {
+					merged.remove(key);
+				}
 			}
 		}
 
@@ -339,9 +349,13 @@ impl Transaction {
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		let Range { start, end } = rng;
+		let Range {
+			start,
+			end,
+		} = rng;
 		let dir = Some(Direction::Prev);
-		let kr = KeyRange::bound(&end.clone().convert(), &start.clone().convert(), None, Some(true));
+		let kr =
+			KeyRange::bound(&end.clone().convert(), &start.clone().convert(), None, Some(true));
 		let kr = kr.map_err(|e| Error::IndexedDbError(e.to_string()))?;
 
 		let store = self.fresh_read_store()?;
@@ -352,13 +366,19 @@ impl Transaction {
 			let key: Key = k.convert();
 			match self.buffer.get(&key) {
 				Some(Buffered::Del) => {}
-				_ => { merged.insert(key, ()); }
+				_ => {
+					merged.insert(key, ());
+				}
 			}
 		}
 		for (key, op) in self.buffer.range(start..end) {
 			match op {
-				Buffered::Set(_) => { merged.insert(key.clone(), ()); }
-				Buffered::Del => { merged.remove(key); }
+				Buffered::Set(_) => {
+					merged.insert(key.clone(), ());
+				}
+				Buffered::Del => {
+					merged.remove(key);
+				}
 			}
 		}
 
@@ -370,9 +390,13 @@ impl Transaction {
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		let Range { start, end } = rng;
+		let Range {
+			start,
+			end,
+		} = rng;
 		let dir = Some(Direction::Next);
-		let kr = KeyRange::bound(&start.clone().convert(), &end.clone().convert(), None, Some(true));
+		let kr =
+			KeyRange::bound(&start.clone().convert(), &end.clone().convert(), None, Some(true));
 		let kr = kr.map_err(|e| Error::IndexedDbError(e.to_string()))?;
 
 		let store = self.fresh_read_store()?;
@@ -384,14 +408,22 @@ impl Transaction {
 			let val: Val = v.convert();
 			match self.buffer.get(&key) {
 				Some(Buffered::Del) => {}
-				Some(Buffered::Set(bv)) => { merged.insert(key, bv.clone()); }
-				None => { merged.insert(key, val); }
+				Some(Buffered::Set(bv)) => {
+					merged.insert(key, bv.clone());
+				}
+				None => {
+					merged.insert(key, val);
+				}
 			}
 		}
 		for (key, op) in self.buffer.range(start..end) {
 			match op {
-				Buffered::Set(v) => { merged.insert(key.clone(), v.clone()); }
-				Buffered::Del => { merged.remove(key); }
+				Buffered::Set(v) => {
+					merged.insert(key.clone(), v.clone());
+				}
+				Buffered::Del => {
+					merged.remove(key);
+				}
 			}
 		}
 
@@ -403,9 +435,13 @@ impl Transaction {
 		if self.done {
 			return Err(Error::TxClosed);
 		}
-		let Range { start, end } = rng;
+		let Range {
+			start,
+			end,
+		} = rng;
 		let dir = Some(Direction::Prev);
-		let kr = KeyRange::bound(&end.clone().convert(), &start.clone().convert(), None, Some(true));
+		let kr =
+			KeyRange::bound(&end.clone().convert(), &start.clone().convert(), None, Some(true));
 		let kr = kr.map_err(|e| Error::IndexedDbError(e.to_string()))?;
 
 		let store = self.fresh_read_store()?;
@@ -417,14 +453,22 @@ impl Transaction {
 			let val: Val = v.convert();
 			match self.buffer.get(&key) {
 				Some(Buffered::Del) => {}
-				Some(Buffered::Set(bv)) => { merged.insert(key, bv.clone()); }
-				None => { merged.insert(key, val); }
+				Some(Buffered::Set(bv)) => {
+					merged.insert(key, bv.clone());
+				}
+				None => {
+					merged.insert(key, val);
+				}
 			}
 		}
 		for (key, op) in self.buffer.range(start..end) {
 			match op {
-				Buffered::Set(v) => { merged.insert(key.clone(), v.clone()); }
-				Buffered::Del => { merged.remove(key); }
+				Buffered::Set(v) => {
+					merged.insert(key.clone(), v.clone());
+				}
+				Buffered::Del => {
+					merged.remove(key);
+				}
 			}
 		}
 
