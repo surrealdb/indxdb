@@ -14,26 +14,43 @@
 
 //! Buffered transaction layer for IndexedDB.
 //!
-//! IndexedDB auto-commits a transaction whenever the event loop is idle and
-//! there are no pending requests. Rust async/await yields to the JS event loop
-//! on every `.await`, so multiple IDB operations within a single Rexie
-//! transaction will cause `TransactionInactiveError` as soon as the second
-//! request fires after an idle microtask checkpoint.
+//! IndexedDB transactions auto-commit whenever the event loop is reached
+//! without any pending requests. Rust async/await yields to the JS event
+//! loop on every `.await`, so multiple IDB operations against a single
+//! transaction will trigger `TransactionInactiveError` as soon as the
+//! second request fires after the first has settled.
 //!
-//! To work around this, we split the transaction into two phases:
+//! To avoid that hazard, this layer splits a logical transaction into two
+//! phases:
 //!
-//! 1. **Read phase** – each read opens a fresh, short-lived read-only IDB
-//!    transaction. This is safe because reads are idempotent and a potential
-//!    auto-commit between reads is harmless. Reads also consult a `BTreeMap`
-//!    write-buffer so that read-your-own-writes works correctly.
+//! 1. **Read phase** -- each read opens a fresh, short-lived read-only IDB
+//!    transaction. Reads are idempotent so a potential auto-commit between
+//!    reads is harmless. Reads also consult an in-memory `BTreeMap` write
+//!    buffer so that read-your-own-writes works correctly.
 //!
-//! 2. **Flush phase** (`commit`) – a *new* read-write IDB transaction is
-//!    opened and every buffered mutation is dispatched. Puts use `put_all`
-//!    which fires all IDB requests synchronously without any `.await` between
-//!    them. Deletes are issued sequentially (each awaited), which is safe
-//!    because the Rust executor polls the next delete in the same microtask
-//!    as the previous completion callback. Finally, `transaction.done()` is
-//!    awaited, which resolves when IDB has durably committed everything.
+//! 2. **Flush phase** (`commit`) -- a single fresh read-write IDB
+//!    transaction is opened and *every* buffered mutation (put + delete) is
+//!    dispatched synchronously, mirroring the spec-recommended `put_all`
+//!    pattern. Only the *last* request handle is awaited; the transaction
+//!    stays active because no `.await` is interleaved with the issuing
+//!    loop. Finally we await the transaction itself, which resolves once
+//!    IDB has durably committed the entire batch.
+//!
+//! This goes through the [`idb`] crate directly (rather than `rexie`)
+//! because we need to construct, hold and only-conditionally-await
+//! heterogeneous request handles to keep the transaction active across a
+//! mixed put+delete batch -- something that rexie's `put_all` helper
+//! cannot express.
+
+use std::collections::BTreeMap;
+use std::ops::Range;
+use std::rc::Rc;
+
+use idb::{
+	request::{DeleteStoreRequest, PutStoreRequest},
+	CursorDirection, Database as IdbDatabase, KeyRange, ObjectStore, Query, TransactionMode,
+};
+use wasm_bindgen::JsValue;
 
 use crate::err::Error;
 use crate::kv::Convert;
@@ -41,15 +58,11 @@ use crate::kv::Key;
 use crate::kv::Val;
 use crate::sp::Operation;
 use crate::sp::Savepoint;
-use rexie::Direction;
-use rexie::KeyRange;
-use rexie::Rexie;
-use rexie::Store;
-use rexie::TransactionMode;
-use std::collections::BTreeMap;
-use std::ops::Range;
-use std::rc::Rc;
-use wasm_bindgen::JsValue;
+
+/// Object store name -- single store layout, kept identical to the
+/// previous rexie-backed implementation so we don't break existing
+/// IndexedDB databases on disk.
+const STORE: &str = "kv";
 
 #[derive(Clone, Debug)]
 pub(crate) enum Buffered {
@@ -57,24 +70,45 @@ pub(crate) enum Buffered {
 	Del,
 }
 
-/// A serializable snapshot isolated database transaction.
+/// The handle to the *last* IDB request we fire during a commit batch.
+///
+/// `idb`'s typed request wrappers (`PutStoreRequest`, `DeleteStoreRequest`)
+/// each implement `IntoFuture` with different output types, so we can't
+/// collect them into a uniform `Vec`. Instead we keep only the most recent
+/// one -- which is all we need to keep the surrounding IDB transaction
+/// active until every queued request has settled.
+enum LastRequest {
+	Put(PutStoreRequest),
+	Delete(DeleteStoreRequest),
+}
+
+impl LastRequest {
+	async fn finish(self) -> Result<(), Error> {
+		match self {
+			LastRequest::Put(req) => req.await.map(|_| ()).map_err(Into::into),
+			LastRequest::Delete(req) => req.await.map_err(Into::into),
+		}
+	}
+}
+
+/// A serializable snapshot-isolated database transaction.
 ///
 /// All mutations are buffered in-memory. On `commit()` they are flushed to
-/// IndexedDB in a single synchronous batch so that the IDB transaction never
-/// goes idle between requests.
+/// IndexedDB in a single synchronous batch so that the IDB transaction
+/// never goes idle between requests.
 pub struct Transaction {
 	pub(crate) done: bool,
 	pub(crate) write: bool,
-	/// Shared reference to the Rexie database for opening new IDB transactions.
-	pub(crate) db: Rc<Rexie>,
-	/// Buffered mutations: key -> Set(val) | Del
+	/// Shared reference to the IDB database for opening fresh transactions.
+	pub(crate) db: Rc<IdbDatabase>,
+	/// Buffered mutations: key -> Set(val) | Del.
 	pub(crate) buffer: BTreeMap<Key, Buffered>,
 	pub(crate) savepoints: Vec<Savepoint>,
 	pub(crate) operations: Vec<Operation>,
 }
 
 impl Transaction {
-	pub(crate) fn new(db: Rc<Rexie>, write: bool) -> Transaction {
+	pub(crate) fn new(db: Rc<IdbDatabase>, write: bool) -> Transaction {
 		Transaction {
 			done: false,
 			write,
@@ -90,10 +124,22 @@ impl Transaction {
 	}
 
 	/// Open a fresh read-only IDB store for a single read request.
-	fn fresh_read_store(&self) -> Result<Store, Error> {
-		let tx =
-			self.db.transaction(&["kv"], TransactionMode::ReadOnly).map_err(|_| Error::TxError)?;
-		tx.store("kv").map_err(|_| Error::TxError)
+	///
+	/// The returned `idb::Transaction` is intentionally dropped together
+	/// with the `ObjectStore` once the caller's await completes -- IDB
+	/// auto-commits read-only transactions which have no further pending
+	/// requests, so this is safe and matches the rexie behaviour.
+	fn fresh_read_store(&self) -> Result<(idb::Transaction, ObjectStore), Error> {
+		let tx = self.db.transaction(&[STORE], TransactionMode::ReadOnly)?;
+		let store = tx.object_store(STORE)?;
+		Ok((tx, store))
+	}
+
+	/// Open a fresh read-write IDB store for the commit flush.
+	fn fresh_write_store(&self) -> Result<(idb::Transaction, ObjectStore), Error> {
+		let tx = self.db.transaction(&[STORE], TransactionMode::ReadWrite)?;
+		let store = tx.object_store(STORE)?;
+		Ok((tx, store))
 	}
 
 	/// Read a key, checking the write buffer first.
@@ -102,8 +148,8 @@ impl Transaction {
 			Some(Buffered::Set(v)) => Ok(Some(v.clone())),
 			Some(Buffered::Del) => Ok(None),
 			None => {
-				let store = self.fresh_read_store()?;
-				let res = store.get(key.clone().convert()).await?;
+				let (_tx, store) = self.fresh_read_store()?;
+				let res = store.get(key.clone().convert())?.await?;
 				match res {
 					Some(v) => Ok(Some(v.convert())),
 					None => Ok(None),
@@ -127,11 +173,13 @@ impl Transaction {
 
 	/// Commit: flush all buffered writes to IndexedDB in one atomic batch.
 	///
-	/// Opens a fresh read-write IDB transaction. Puts are batched via
-	/// `put_all` (all IDB requests fired synchronously, only the last
-	/// awaited). Deletes are issued sequentially -- each `await` is safe
-	/// because the next `delete()` call is queued in the same microtask
-	/// as the previous request's completion, keeping the transaction alive.
+	/// Opens a single fresh read-write IDB transaction. Every buffered put
+	/// and delete is dispatched synchronously -- no `.await` is interleaved
+	/// with the issuing loop, so the IDB transaction stays continuously
+	/// active until every request has been queued. Only the last request
+	/// is awaited (this is the same pattern `idb::ObjectStore::put_all`
+	/// uses internally). Finally we await the transaction itself, which
+	/// resolves when the browser has durably committed the batch.
 	pub async fn commit(&mut self) -> Result<(), Error> {
 		if self.done {
 			return Err(Error::TxClosed);
@@ -145,51 +193,44 @@ impl Transaction {
 			return Ok(());
 		}
 
-		let flush_tx =
-			self.db.transaction(&["kv"], TransactionMode::ReadWrite).map_err(|_| Error::TxError)?;
-		let flush_store = flush_tx.store("kv").map_err(|_| Error::TxError)?;
-
-		// Build an iterator of (JsValue, Option<JsValue>) for put_all, and
-		// collect deletes separately.
+		let (tx, store) = self.fresh_write_store()?;
 		let buffer = std::mem::take(&mut self.buffer);
 
-		let mut puts: Vec<(JsValue, Option<JsValue>)> = Vec::new();
-		let mut deletes: Vec<JsValue> = Vec::new();
-
+		// Fire every put/delete synchronously, keeping only the most
+		// recently issued request handle. Because there is no `.await`
+		// between iterations, the IDB transaction never sees an empty
+		// pending-request queue and so cannot auto-commit early.
+		let mut last: Option<LastRequest> = None;
 		for (key, op) in buffer {
 			let js_key: JsValue = key.convert();
 			match op {
 				Buffered::Set(val) => {
 					let js_val: JsValue = val.convert();
-					puts.push((js_val, Some(js_key)));
+					let req = store.put(&js_val, Some(&js_key))?;
+					last = Some(LastRequest::Put(req));
 				}
 				Buffered::Del => {
-					deletes.push(js_key);
+					let req = store.delete(Query::Key(js_key))?;
+					last = Some(LastRequest::Delete(req));
 				}
 			}
 		}
 
-		// Use put_all which fires all IDB requests synchronously (no .await
-		// between them) and only awaits the last request's result.
-		if !puts.is_empty() {
-			flush_store.put_all(puts.into_iter()).await?;
+		// Await the last request to surface any per-request error before
+		// the transaction tries to commit.
+		if let Some(req) = last {
+			req.finish().await?;
 		}
 
-		// Delete all keys. Each `Store::delete` awaits one IDB request,
-		// but this is safe: completing request N immediately queues
-		// request N+1 within the same microtask (wasm_bindgen_futures
-		// polls continuations synchronously in the IDB callback), so
-		// the transaction always has a pending request and never
-		// auto-commits. This is the same pattern rexie's `scan` uses
-		// internally when iterating a cursor.
-		for js_key in deletes {
-			flush_store.delete(js_key).await?;
+		// Wait for the IDB transaction to durably commit the whole batch.
+		// `tx.await` resolves to `TransactionResult::{Committed, Aborted}`
+		// or fails with a DOM error.
+		match tx.await? {
+			idb::TransactionResult::Committed => Ok(()),
+			idb::TransactionResult::Aborted => {
+				Err(Error::IndexedDbError("transaction aborted".to_string()))
+			}
 		}
-
-		// Wait for the IDB transaction to durably commit everything.
-		flush_tx.done().await?;
-
-		Ok(())
 	}
 
 	// ------------------------------------------------------------------
@@ -204,9 +245,9 @@ impl Transaction {
 			Some(Buffered::Set(_)) => Ok(true),
 			Some(Buffered::Del) => Ok(false),
 			None => {
-				let store = self.fresh_read_store()?;
-				let res = store.key_exists(key.convert()).await?;
-				Ok(res)
+				let (_tx, store) = self.fresh_read_store()?;
+				let res = store.get_key(key.convert())?.await?;
+				Ok(res.is_some())
 			}
 		}
 	}
@@ -301,7 +342,7 @@ impl Transaction {
 	}
 
 	// ------------------------------------------------------------------
-	// Range operations – merge IDB results with the write buffer
+	// Range operations -- merge IDB results with the write buffer
 	// ------------------------------------------------------------------
 
 	pub async fn keys(&self, rng: Range<Key>, limit: u32) -> Result<Vec<Key>, Error> {
@@ -312,21 +353,17 @@ impl Transaction {
 			start,
 			end,
 		} = rng;
-		let dir = Some(Direction::Next);
-		let kr =
-			KeyRange::bound(&start.clone().convert(), &end.clone().convert(), None, Some(true));
-		let kr = kr.map_err(|e| Error::IndexedDbError(e.to_string()))?;
-
-		let store = self.fresh_read_store()?;
-		let idb_results = store.scan(Some(kr), Some(limit), None, dir).await?;
+		let kr = bound(&start, &end)?;
+		let idb_results =
+			scan_cursor(&self.fresh_read_store()?.1, kr, Some(limit), CursorDirection::Next, false)
+				.await?;
 
 		let mut merged: BTreeMap<Key, ()> = BTreeMap::new();
 		for (k, _) in idb_results {
-			let key: Key = k.convert();
-			match self.buffer.get(&key) {
+			match self.buffer.get(&k) {
 				Some(Buffered::Del) => {}
 				_ => {
-					merged.insert(key, ());
+					merged.insert(k, ());
 				}
 			}
 		}
@@ -341,8 +378,7 @@ impl Transaction {
 			}
 		}
 
-		let res: Vec<Key> = merged.into_keys().take(limit as usize).collect();
-		Ok(res)
+		Ok(merged.into_keys().take(limit as usize).collect())
 	}
 
 	pub async fn keysr(&self, rng: Range<Key>, limit: u32) -> Result<Vec<Key>, Error> {
@@ -353,21 +389,17 @@ impl Transaction {
 			start,
 			end,
 		} = rng;
-		let dir = Some(Direction::Prev);
-		let kr =
-			KeyRange::bound(&end.clone().convert(), &start.clone().convert(), None, Some(true));
-		let kr = kr.map_err(|e| Error::IndexedDbError(e.to_string()))?;
-
-		let store = self.fresh_read_store()?;
-		let idb_results = store.scan(Some(kr), Some(limit), None, dir).await?;
+		let kr = bound(&start, &end)?;
+		let idb_results =
+			scan_cursor(&self.fresh_read_store()?.1, kr, Some(limit), CursorDirection::Prev, false)
+				.await?;
 
 		let mut merged: BTreeMap<Key, ()> = BTreeMap::new();
 		for (k, _) in idb_results {
-			let key: Key = k.convert();
-			match self.buffer.get(&key) {
+			match self.buffer.get(&k) {
 				Some(Buffered::Del) => {}
 				_ => {
-					merged.insert(key, ());
+					merged.insert(k, ());
 				}
 			}
 		}
@@ -382,8 +414,7 @@ impl Transaction {
 			}
 		}
 
-		let res: Vec<Key> = merged.into_keys().rev().take(limit as usize).collect();
-		Ok(res)
+		Ok(merged.into_keys().rev().take(limit as usize).collect())
 	}
 
 	pub async fn scan(&self, rng: Range<Key>, limit: u32) -> Result<Vec<(Key, Val)>, Error> {
@@ -394,25 +425,20 @@ impl Transaction {
 			start,
 			end,
 		} = rng;
-		let dir = Some(Direction::Next);
-		let kr =
-			KeyRange::bound(&start.clone().convert(), &end.clone().convert(), None, Some(true));
-		let kr = kr.map_err(|e| Error::IndexedDbError(e.to_string()))?;
-
-		let store = self.fresh_read_store()?;
-		let idb_results = store.scan(Some(kr), Some(limit), None, dir).await?;
+		let kr = bound(&start, &end)?;
+		let idb_results =
+			scan_cursor(&self.fresh_read_store()?.1, kr, Some(limit), CursorDirection::Next, true)
+				.await?;
 
 		let mut merged: BTreeMap<Key, Val> = BTreeMap::new();
 		for (k, v) in idb_results {
-			let key: Key = k.convert();
-			let val: Val = v.convert();
-			match self.buffer.get(&key) {
+			match self.buffer.get(&k) {
 				Some(Buffered::Del) => {}
 				Some(Buffered::Set(bv)) => {
-					merged.insert(key, bv.clone());
+					merged.insert(k, bv.clone());
 				}
 				None => {
-					merged.insert(key, val);
+					merged.insert(k, v);
 				}
 			}
 		}
@@ -427,8 +453,7 @@ impl Transaction {
 			}
 		}
 
-		let res: Vec<(Key, Val)> = merged.into_iter().take(limit as usize).collect();
-		Ok(res)
+		Ok(merged.into_iter().take(limit as usize).collect())
 	}
 
 	pub async fn scanr(&self, rng: Range<Key>, limit: u32) -> Result<Vec<(Key, Val)>, Error> {
@@ -439,25 +464,20 @@ impl Transaction {
 			start,
 			end,
 		} = rng;
-		let dir = Some(Direction::Prev);
-		let kr =
-			KeyRange::bound(&end.clone().convert(), &start.clone().convert(), None, Some(true));
-		let kr = kr.map_err(|e| Error::IndexedDbError(e.to_string()))?;
-
-		let store = self.fresh_read_store()?;
-		let idb_results = store.scan(Some(kr), Some(limit), None, dir).await?;
+		let kr = bound(&start, &end)?;
+		let idb_results =
+			scan_cursor(&self.fresh_read_store()?.1, kr, Some(limit), CursorDirection::Prev, true)
+				.await?;
 
 		let mut merged: BTreeMap<Key, Val> = BTreeMap::new();
 		for (k, v) in idb_results {
-			let key: Key = k.convert();
-			let val: Val = v.convert();
-			match self.buffer.get(&key) {
+			match self.buffer.get(&k) {
 				Some(Buffered::Del) => {}
 				Some(Buffered::Set(bv)) => {
-					merged.insert(key, bv.clone());
+					merged.insert(k, bv.clone());
 				}
 				None => {
-					merged.insert(key, val);
+					merged.insert(k, v);
 				}
 			}
 		}
@@ -472,8 +492,7 @@ impl Transaction {
 			}
 		}
 
-		let res: Vec<(Key, Val)> = merged.into_iter().rev().take(limit as usize).collect();
-		Ok(res)
+		Ok(merged.into_iter().rev().take(limit as usize).collect())
 	}
 
 	// ------------------------------------------------------------------
@@ -494,7 +513,7 @@ impl Transaction {
 	}
 
 	/// Rollback to the most recent savepoint by replaying undo operations
-	/// against the in-memory buffer. No IDB calls needed.
+	/// against the in-memory buffer. No IDB calls are needed.
 	pub async fn rollback_to_savepoint(&mut self) -> Result<(), Error> {
 		if self.done {
 			return Err(Error::TxClosed);
@@ -522,4 +541,53 @@ impl Transaction {
 		self.operations = savepoint.operations;
 		Ok(())
 	}
+}
+
+/// Build a `KeyRange` covering `start <= key < end`.
+fn bound(start: &Key, end: &Key) -> Result<KeyRange, Error> {
+	let lower: JsValue = start.clone().convert();
+	let upper: JsValue = end.clone().convert();
+	KeyRange::bound(&lower, &upper, None, Some(true)).map_err(Into::into)
+}
+
+/// Iterate a cursor over `range`, returning up to `limit` `(key, value)`
+/// pairs. When `with_value` is `false`, the returned values are empty
+/// `Vec`s -- callers that only need keys should use `false` to avoid a
+/// pointless clone of the stored value bytes.
+async fn scan_cursor(
+	store: &ObjectStore,
+	range: KeyRange,
+	limit: Option<u32>,
+	direction: CursorDirection,
+	with_value: bool,
+) -> Result<Vec<(Key, Val)>, Error> {
+	let cursor = store.open_cursor(Some(Query::KeyRange(range)), Some(direction))?.await?;
+	let Some(cursor) = cursor else {
+		return Ok(Vec::new());
+	};
+	let mut cursor = cursor.into_managed();
+	let mut out = Vec::new();
+	let cap = limit.unwrap_or(u32::MAX);
+	for _ in 0..cap {
+		let key = cursor.key()?;
+		let value = if with_value {
+			cursor.value()?
+		} else {
+			Some(JsValue::NULL)
+		};
+		match (key, value) {
+			(Some(k), Some(v)) => {
+				let key: Key = k.convert();
+				let val: Val = if with_value {
+					v.convert()
+				} else {
+					Vec::new()
+				};
+				out.push((key, val));
+				cursor.next(None).await?;
+			}
+			_ => break,
+		}
+	}
+	Ok(out)
 }
