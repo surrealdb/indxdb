@@ -120,9 +120,7 @@ async fn multi_transaction_use_simulation() {
 	tx.commit().await.expect("ns commit");
 
 	let mut tx = db.begin(true).await.expect("begin db");
-	tx.set(b"db:default:default".to_vec(), b"{database_id:1}".to_vec())
-		.await
-		.expect("db put");
+	tx.set(b"db:default:default".to_vec(), b"{database_id:1}".to_vec()).await.expect("db put");
 	tx.commit().await.expect("db commit");
 
 	let tx = db.begin(false).await.expect("begin read");
@@ -187,20 +185,11 @@ async fn scan_merges_buffer_with_store() {
 	tx.del(vec![b'k', 2]).await.expect("delete middle");
 	tx.set(vec![b'k', 3], vec![33]).await.expect("override");
 
-	let scanned = tx
-		.scan(vec![b'k', 0]..vec![b'k', 6], 100)
-		.await
-		.expect("scan");
+	let scanned = tx.scan(vec![b'k', 0]..vec![b'k', 6], 100).await.expect("scan");
 	let keys: Vec<Vec<u8>> = scanned.iter().map(|(k, _)| k.clone()).collect();
 	assert_eq!(
 		keys,
-		vec![
-			vec![b'k', 0],
-			vec![b'k', 1],
-			vec![b'k', 3],
-			vec![b'k', 4],
-			vec![b'k', 5],
-		]
+		vec![vec![b'k', 0], vec![b'k', 1], vec![b'k', 3], vec![b'k', 4], vec![b'k', 5],]
 	);
 	let vals: Vec<Vec<u8>> = scanned.iter().map(|(_, v)| v.clone()).collect();
 	assert_eq!(vals, vec![vec![0], vec![1], vec![33], vec![4], vec![5]]);
