@@ -45,8 +45,28 @@ pub enum Error {
 	IndexedDbError(String),
 }
 
-impl From<rexie::Error> for Error {
-	fn from(v: rexie::Error) -> Self {
-		Error::IndexedDbError(v.to_string())
+impl From<idb::Error> for Error {
+	fn from(v: idb::Error) -> Self {
+		Error::IndexedDbError(format_idb_error(v))
+	}
+}
+
+/// Formats an `idb::Error`, replacing the unhelpful `[object DOMException]`
+/// rendering with the actual `name: message` pair from the DOM. Without this,
+/// every IndexedDB failure surfaced to callers as the cryptic string
+/// "An IndexedDB error occured: idb error", which masked real issues such as
+/// `TransactionInactiveError` or `InvalidStateError`.
+fn format_idb_error(err: idb::Error) -> String {
+	match err {
+		idb::Error::DomException(dom_ex) => {
+			let name = dom_ex.name();
+			let message = dom_ex.message();
+			if message.is_empty() {
+				name
+			} else {
+				format!("{name}: {message}")
+			}
+		}
+		other => other.to_string(),
 	}
 }
